@@ -14,17 +14,17 @@ public import Lean.Kernel.InLean.Push
 /-!
 # InLean: the declaration step
 
-Twin of `ConLeche/Cached/ParsedC.lean`'s `checkDeclC` over
+Twin of `ConLeche.Cached.ParsedC`'s `checkDeclC` over
 `Lean.Declaration`, with the shared checks it runs
-(`ConLeche/Kernel/CheckerBase.lean`'s `checkConstantVal`,
-`ConLeche/Kernel/DeclCheck.lean`'s guards and pins): the constant checks,
+(`ConLeche.Kernel.CheckerBase`'s `checkConstantVal`,
+`ConLeche.Kernel.DeclCheck`'s guards and pins): the constant checks,
 the value checks, the certified `Nat` operations (`certifyNatEqs`,
 `checkDivModPinF`), the compiler-trust opaques (`checkReducePinF`), the
 pinned axioms (`stdAxiomOkF`, `trustCompilerOkF`, `ofReduceAxOkF`) and the
 quotient package (`checkQuotRecordC`).
 
 What a declaration adds is returned, not pushed (`Added`); the caller adds
-it (`Lean/Kernel/InLean/AddDecl.lean`).  A value is checked in the environment before
+it (`Lean.Kernel.InLean.AddDecl`).  A value is checked in the environment before
 its declaration's constants, as con-leche's fold checks a record at the
 view below it.
 
@@ -48,8 +48,13 @@ structure Config where
   coreAxioms : Bool := false
   /-- **A pinned `Nat` operation whose certification declines is accepted**,
   and the fast path, which fires by name, then fires on it.  The prelude
-  is assumed good: the official kernel fires by name with no certificate.  `false` is con-leche's policy. -/
+  is assumed good: the official kernel fires by name with no certificate,
+  and in a replay in dependency order an operation can arrive before what
+  its certificates read.  `false` is con-leche's policy. -/
   uncertifiedNatOps : Bool := true
+  /-- The official kernel's resource limits (`Limits`; by default none but
+  the numerals' size). -/
+  limits : Limits := {}
 
 /-- What a declaration adds: its constants, in order, and whether it is the
 quotient package (official's `quotInit` flag). -/
@@ -62,29 +67,45 @@ variable (mode : CheckMode)
 
 /-- The core's entry points at the plain tower (twin of `sharedOpsC`). -/
 @[inline] def opInfer (fe : FEnv) (d : Nat) (e : Expr) : CheckCM Expr :=
-  (coreKnotI mode false fe checkFuel).infer d e
+  (coreKnotI mode false fe (fe.limits.recDepth.getD checkFuel)).infer d e
 @[inline] def opDefeq (fe : FEnv) (d : Nat) (a b : Expr) : CheckCM Bool :=
-  (coreKnotI mode false fe checkFuel).defeq d a b
+  (coreKnotI mode false fe (fe.limits.recDepth.getD checkFuel)).defeq d a b
 @[inline] def opSort (fe : FEnv) (d : Nat) (e : Expr) : CheckCM Level :=
-  ensureSortI (coreKnotI mode false fe checkFuel) d e
+  ensureSortI (coreKnotI mode false fe (fe.limits.recDepth.getD checkFuel)) d e
 @[inline] def opWhnf (fe : FEnv) (d : Nat) (e : Expr) : CheckCM Expr :=
-  (coreKnotI mode false fe checkFuel).whnf d e
+  (coreKnotI mode false fe (fe.limits.recDepth.getD checkFuel)).whnf d e
 
 end
 
 /-! ## Syntactic guards -/
 
-/-- Twin of `unresolvedConstsErrorL`. -/
-def unresolvedConstsErrorL (strOk : Bool) (where_ : String) (e : Expr) : CheckError :=
+/-- Twin of `unresolvedConstsErrorL`; a constant the check does not see is
+named (`unseenConstError`). -/
+def unresolvedConstsErrorL (fe : FEnv) (strOk : Bool) (where_ : String) (e : Expr) : CheckError :=
   if !strOk && EO.any (fun x => match x with | .lit (.strVal _) => true | _ => false) e then
     .notImplemented "string literals before the String support declarations"
-  else if (EO.usedConstants e).contains sorryAxName then
-    .notImplemented s!"use of the sorryAx axiom in {where_}"
-  else .invalid s!"unknown constant in {where_}"
+  else
+    let cs := EO.usedConstants e
+    if cs.contains sorryAxName then
+      .notImplemented s!"use of the sorryAx axiom in {where_}"
+    else match cs.find? (fun c => (fe.find? c).isNone) with
+      | some c => unseenConstError fe c
+      | none => .invalid s!"unknown constant in {where_}"
+
+/-- Twin of `Expr.constsResolve` on a term without free variables: every
+constant and every projection's structure stored, a literal's support
+declarations stored. -/
+def constsResolve (fe : FEnv) (e : Expr) : Bool :=
+  !EO.any (fun
+    | .const c _ => (fe.find? c).isNone
+    | .proj s _ _ => (fe.find? s).isNone
+    | .lit (.natVal _) => !natLitStoredF fe
+    | .lit (.strVal _) => !strLitStoredF fe
+    | _ => false) e
 
 /-- Twin of the syntactic gates of `checkConstantValC`/`checkDefnValCI` on
 one term: closed, no free variable or metavariable, its level parameters
-declared, its constants stored. -/
+declared, its constants resolving. -/
 def checkTermWF (fe : FEnv) (what : String) (lps : List Name) (e : Expr) : CheckCM Unit := do
   if e.hasLooseBVars then throw (.invalid s!"loose bound variable in {what}")
   if e.hasFVar then throw (.invalid s!"unexpected free variable in {what}")
@@ -92,13 +113,13 @@ def checkTermWF (fe : FEnv) (what : String) (lps : List Name) (e : Expr) : Check
   if e.hasLevelParam then
     unless (EO.levelParams e).all lps.contains do
       throw (.invalid s!"undeclared universe parameter in {what}")
-  unless (EO.usedConstants e).all (fun c => (fe.find? c).isSome) do
-    throw (unresolvedConstsErrorL (strLitStoredF fe) what e)
+  unless constsResolve fe e do
+    throw (unresolvedConstsErrorL fe (strLitStoredF fe) what e)
 
 /-! ## The literal names' shapes (twin of `litShapeOk`) -/
 
 /-- A stored type compared with a shape, `mdata` ignored. -/
-@[inline] def tyIs (ty shape : Expr) : Bool := EO.alphaEq ty shape
+@[inline] def tyIs (ty shape : Expr) : Bool := ty == shape
 
 def natTy : Expr := .const natName []
 def charTy : Expr := .const charName []
@@ -140,11 +161,8 @@ variable (mode : CheckMode)
 /-- Twin of `checkConstantValC`. -/
 def checkConstantValC (fe : FEnv) (n : Name) (lps : List Name) (ty : Expr)
     (allowOp : Bool := false) : CheckCM Unit := do
-  if (fe.env.find? n).isSome then throw (.invalid s!"duplicate declaration {n}")
-  if reservedBasisNames.contains n then throw (.invalid s!"reserved basis name {n}")
-  -- the official kernel's policy (`coreAxioms`) admits any declaration at these names: the
-  -- elaborator adds a recursive definition as an axiom while it elaborates it (`addAsAxiom`)
-  if natOpName n && !allowOp && !fe.coreAxioms then
+  if (fe.env.find? n).isSome then throw (alreadyDeclared n)
+  if natOpName n && !allowOp then
     throw (.invalid s!"a certified Nat operation's name, not a definition: {n}")
   unless litShapeOk n lps ty do
     throw (.notImplemented s!"a declaration at a literal's name with another shape ({n})")
@@ -172,13 +190,15 @@ def natOpCod (fe : FEnv) (c : Name) (e : Expr) : Bool :=
 /-- Twin of `natOpTyPinnedF`. -/
 def natOpTyPinned (fe : FEnv) (c : Name) (ty : Expr) : Bool :=
   if c == natPredName then
-    match ty with
+    match EO.stripTop (ty) with
     | .forallE _ dom body _ => tyIs dom natTy && natOpCod fe c body
     | _ => false
   else
-    match ty with
-    | .forallE _ dom (.forallE _ dom2 body _) _ =>
-      tyIs dom natTy && tyIs dom2 natTy && natOpCod fe c body
+    match EO.stripTop (ty) with
+    | .forallE _ dom b _ =>
+      match EO.stripTop b with
+      | .forallE _ dom2 body _ => tyIs dom natTy && tyIs dom2 natTy && natOpCod fe c body
+      | _ => false
     | _ => false
 
 /-- Twin of `natOpStoredOkF`. -/
@@ -213,10 +233,6 @@ def certifyNatEqs (fe : FEnv) : List (Expr × Expr) → CheckCM Bool
   | [] => pure true
   | (l, r) :: rest => do
     if ← opDefeq mode fe 2 l r then certifyNatEqs fe rest else pure false
-
-/-- Every constant of `e` is stored. -/
-def constsResolve (fe : FEnv) (e : Expr) : Bool :=
-  (EO.usedConstants e).all fun c => (fe.find? c).isSome
 
 /-- Twin of `divModEnvGuardF`. -/
 def divModEnvGuard (fe2 : FEnv) (c : Name) : Bool :=
@@ -266,8 +282,45 @@ def checkDivModCerts (fe : FEnv) (c : Name) (annVal : Expr) (x y : Expr) :
     else pure false
   | _, _ => pure false
 
-/-- Twin of `checkDivModPinF` (`checkDivModPinLoopF`, `checkDivModPinAtF`,
-`checkTypePinsF`) over the committed pin variants. -/
+/-- Twin of `checkTypePinsF`. -/
+def checkTypePins (fe : FEnv) : List (Name × Expr) → CheckCM Bool
+  | [] => pure true
+  | (n, ty) :: rest => do
+    let stored := match fe.find? n with
+      | some ci => ci.type
+      | none => .sort .zero
+    if ← opDefeq mode fe 0 stored ty then checkTypePins fe rest else pure false
+
+/-- Twin of `checkDivModPinAtF`: the type pins, then the pin, then the
+certificates. -/
+def checkDivModPinAt (fe : FEnv) (c : Name) (value' x y : Expr) (op : PinOp) : CheckCM Bool := do
+  if ← checkTypePins mode fe op.typePins.toList then
+    if ← opDefeq mode fe 0 value' op.pin then
+      checkDivModCerts mode fe c value' x y (divModCertStmts x y c) op.proofs.toList
+    else pure false
+  else pure false
+
+/-- Twin of `checkDivModPinLoopF`. -/
+def checkDivModPinLoop (fe : FEnv) (c : Name) (value' x y : Expr) :
+    List PinSet → List String → CheckCM Unit
+  | [], tried =>
+    throw (.notImplemented s!"unsupported Nat.div/mod spelling ({c}: no pin variant matched — \
+      {String.intercalate "; " tried})")
+  | ps :: rest, tried =>
+    match ps.op? c with
+    | none => checkDivModPinLoop fe c value' x y rest (tried ++ [s!"{ps.toolchain}: no pin"])
+    | some op =>
+      if divModPinGuard fe op && ((divModCertStmts x y c).zip op.proofs.toList).all
+          (fun p => divModCertGuard fe c value' p.1.1 p.1.2 p.2) then do
+        if ← checkDivModPinAt mode fe c value' x y op then pure ()
+        else
+          checkDivModPinLoop fe c value' x y rest (tried ++ [s!"{ps.toolchain}: a type pin or \
+            the pin not definitionally equal, or a certificate failed"])
+      else
+        checkDivModPinLoop fe c value' x y rest
+          (tried ++ [s!"{ps.toolchain}: pin or certificate ground constants absent"])
+
+/-- Twin of `checkDivModPinF` over the committed pin variants. -/
 def checkDivModPin (fe fe2 : FEnv) (c : Name) (value' : Expr) : CheckCM Unit := do
   unless divModEnvGuard fe2 c do
     throw (.notImplemented s!"unsupported Nat.div/mod environment ({c})")
@@ -275,46 +328,46 @@ def checkDivModPin (fe fe2 : FEnv) (c : Name) (value' : Expr) : CheckCM Unit := 
     | .ok s => pure s
     | .error e => throw (.internal s!"the Nat-operation pin dumps do not decode: {e}")
   let (x, y) ← natVars
-  let mut tried : Array String := #[]
-  for ps in sets do
-    let some op := ps.op? c
-      | tried := tried.push s!"{ps.toolchain}: no pin"; continue
-    let stmts := divModCertStmts x y c
-    if divModPinGuard fe op &&
-        (stmts.zip op.proofs.toList).all (fun p => divModCertGuard fe c value' p.1.1 p.1.2 p.2) then
-      let mut typesOk := true
-      for (n, ty) in op.typePins do
-        let stored := match fe.find? n with
-          | some ci => ci.type
-          | none => .sort .zero
-        unless ← opDefeq mode fe 0 stored ty do typesOk := false; break
-      if typesOk && (← opDefeq mode fe 0 value' op.pin) &&
-          (← checkDivModCerts mode fe c value' x y stmts op.proofs.toList) then
-        return
-      tried := tried.push s!"{ps.toolchain}: a type pin or the pin not definitionally equal, or \
-        a certificate failed"
-    else
-      tried := tried.push s!"{ps.toolchain}: pin or certificate ground constants absent"
-  throw (.notImplemented s!"unsupported Nat.div/mod spelling ({c}: no pin variant matched — \
-    {String.intercalate "; " tried.toList})")
+  checkDivModPinLoop mode fe c value' x y sets.toList []
 
 /-! ## The compiler-trust opaques and axioms -/
 
-def pinFound (fe : FEnv) (p : Pin) : Bool :=
+/-- A pinned family's inductive type, as master's guards read it: stored as
+an inductive (`some (.indInfo cv _)`) matching the pin. -/
+def pinFoundInd (fe : FEnv) (p : Pin) : Bool :=
   match fe.find? p.name with
-  | some ci => p.matches ci
-  | none => false
+  | some ci@(.inductInfo _) => p.matchesExact ci
+  | _ => false
 
-/-- Twin of `reduceElemOkF`. -/
+/-- A pinned family's constructor, as master's guards read it: stored as a
+constructor with the pinned counts (`some (.ctorInfo cv nP nF)`) matching the
+pin. -/
+def pinFoundCtor (fe : FEnv) (p : Pin) (nP nF : Nat) : Bool :=
+  match fe.find? p.name with
+  | some ci@(.ctorInfo v) => v.numParams == nP && v.numFields == nF && p.matchesExact ci
+  | _ => false
+
+/-- A pinned family's recursor, as master's guards read it: stored as a
+recursor with the pinned major index and rule prefix (`some (.recInfo cv mI rP _ _)`,
+the counts con-leche's record carries) matching the pin. -/
+def pinFoundRec (fe : FEnv) (p : Pin) (mI rP : Nat) : Bool :=
+  match fe.find? p.name with
+  | some ci@(.recInfo v) =>
+    v.numParams + v.numMotives + v.numMinors + v.numIndices == mI &&
+      v.numParams + v.numMotives + v.numMinors == rP && p.matchesExact ci
+  | _ => false
+
+/-- Twin of `reduceElemOkF`: `Nat` resp. `Bool` stored as an inductive
+matching its pin. -/
 def reduceElemOk (fe : FEnv) (c : Name) : Bool :=
-  if c == reduceNatName then natLitStoredF fe && pinFound fe natPin
-  else pinFound fe boolPin
+  if c == reduceNatName then pinFoundInd fe natPin
+  else pinFoundInd fe boolPin
 
 /-- Twin of `reduceStoredOkF` (Lean stores the opaque as an opaque). -/
 def reduceStoredOk (fe : FEnv) (c : Name) : Bool :=
   match fe.find? c with
-  | some ci@(.opaqueInfo _) => (reduceOpPin c).matches ci
-  | some ci@(.axiomInfo _) => (reduceOpPin c).matches ci
+  | some ci@(.opaqueInfo _) => (reduceOpPin c).matchesExact ci
+  | some ci@(.axiomInfo _) => (reduceOpPin c).matchesExact ci
   | _ => false
 
 /-- Twin of `checkReducePinF`. -/
@@ -330,26 +383,28 @@ def checkReducePin (fe fe2 : FEnv) (c : Name) (value : Expr) : CheckCM Unit := d
   unless ← opDefeq mode fe 1 (.app value x) x do
     throw (.internal s!"pinned compiler-trust opaque is not the identity ({c})")
 
-/-- Twin of `stdAxiomOkF`. -/
+/-- Twin of `stdAxiomOkF`: the families' kinds and counts read as master's. -/
 def stdAxiomOk (fe : FEnv) (n : Name) (lps : List Name) (ty : Expr) : Bool :=
-  let me : Pin → Bool := fun p => p.matchesDecl n lps ty
+  let me : Pin → Bool := fun p => p.matchesDeclExact n lps ty
   if n == propextName then
-    (fe.find? eqName).isSome && pinFound fe iffPin && pinFound fe iffIntroPin &&
-      pinFound fe iffRecPin && me propextPin
+    (fe.find? eqName).isSome && pinFoundInd fe iffPin && pinFoundCtor fe iffIntroPin 2 2 &&
+      pinFoundRec fe iffRecPin 4 4 && me propextPin
   else if n == choiceName then
-    pinFound fe nonemptyPin && pinFound fe nonemptyIntroPin && pinFound fe nonemptyRecPin &&
-      me choicePin
+    pinFoundInd fe nonemptyPin && pinFoundCtor fe nonemptyIntroPin 1 1 &&
+      pinFoundRec fe nonemptyRecPin 3 3 && me choicePin
   else false
 
-/-- Twin of `trustCompilerOkF`. -/
+/-- Twin of `trustCompilerOkF`: `True` an inductive, `True.intro` a constructor
+with no parameter and no field. -/
 def trustCompilerOk (fe : FEnv) (n : Name) (lps : List Name) (ty : Expr) : Bool :=
-  pinFound fe truePin && pinFound fe trueIntroPin && trustCompilerPin.matchesDecl n lps ty
+  pinFoundInd fe truePin && pinFoundCtor fe trueIntroPin 0 0 &&
+    trustCompilerPin.matchesDeclExact n lps ty
 
 /-- Twin of `ofReduceAxOkF`. -/
 def ofReduceAxOk (fe : FEnv) (n : Name) (lps : List Name) (ty : Expr) : Bool :=
   let c := ofReduceOp n
   (fe.find? eqName).isSome && reduceElemOk fe c && reduceStoredOk fe c &&
-    (ofReducePin n).matchesDecl n lps ty
+    (ofReducePin n).matchesDeclExact n lps ty
 
 /-! ## The quotient package -/
 
@@ -365,7 +420,7 @@ def checkQuotC (fe : FEnv) : CheckCM Added := do
   unless quotPredsOk fe do
     throw (.notImplemented "quotient declaration before what it needs")
   for p in [quotPin, quotMkPin, quotLiftPin, quotIndPin] do
-    if (fe.env.find? p.name).isSome then throw (.invalid s!"duplicate declaration {p.name}")
+    if (fe.env.find? p.name).isSome then throw (alreadyDeclared p.name)
   let mk (p : Pin) (k : QuotKind) : ConstantInfo :=
     .quotInfo { name := p.name, levelParams := p.lps, type := p.type, kind := k }
   return { consts := #[mk quotPin .type, mk quotMkPin .ctor, mk quotLiftPin .lift,
@@ -432,11 +487,19 @@ Lean's environment (the elaborator needs it), and is no constant unless
 def checkAxiomC (cfg : Config) (fe : FEnv) (v : AxiomVal) : CheckCM Added := do
   let ci := ConstantInfo.axiomInfo v
   if v.name == quotSoundName then
-    if (quotSoundPin.matches ci) && quotPredsOk fe && (fe.find? quotMkName).isSome then
-      return { consts := #[ci] }
-    else throw (.notImplemented "quotient soundness axiom mismatch")
+    -- twin of `checkQuotRecordC fe .sound`: the pin, what it needs, then
+    -- `installBasisDeclF`'s freshness (official's `check_name`)
+    unless quotSoundHit v.name v.levelParams v.type do
+      throw (.notImplemented "quotient soundness axiom mismatch")
+    unless quotPredsOk fe && (fe.find? quotName).isSome && (fe.find? quotMkName).isSome do
+      throw (.notImplemented "quotient declaration before what it needs")
+    if (fe.env.find? v.name).isSome then throw (alreadyDeclared v.name)
+    return { consts := #[ci] }
   let fe' := { fe with safety := if v.isUnsafe then .unsafe else .safe }
-  checkConstantValC mode fe' v.name v.levelParams v.type
+  -- the official policy (`coreAxioms`) admits an axiom at a certified `Nat`
+  -- operation's name: the elaborator adds a recursive definition as an axiom
+  -- while it elaborates it (`addAsAxiom`); any other declaration there is checked
+  checkConstantValC mode fe' v.name v.levelParams v.type (allowOp := fe.coreAxioms)
   if v.isUnsafe then return { consts := #[ci] }
   if stdAxiomOk fe v.name v.levelParams v.type then return { consts := #[ci] }
   if v.name == trustCompilerName then

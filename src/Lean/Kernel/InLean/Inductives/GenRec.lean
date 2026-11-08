@@ -12,7 +12,7 @@ public import Lean.Kernel.InLean.Inductives.RecCheck
 /-!
 # InLean's inductive check: the generated recursors
 
-Twin of `ConLeche/Kernel/Inductives/GenRec.lean`: every recursor of the block
+Twin of `ConLeche.Kernel.Inductives.GenRec`: every recursor of the block
 regenerated from its classes (its type and its rules) and checked.  What
 con-leche writes in `Option` (a shape that may not be there) is in
 `OptionT CheckCM` here, because its variables are interned.
@@ -195,7 +195,7 @@ def classNodesAgree (ops : CheckerOps) (env : FEnv) (p : BlockShape) (formerTys 
 
 /-- Twin of `classLeafAt`. -/
 def classLeafAt (M : TargetMajor) (leaf : Expr) : Bool :=
-  match leaf.getAppFn with
+  match leaf.getAppFnT with
   | .const I _ => I == M.ind
   | _ => false
 
@@ -227,7 +227,7 @@ def classCtorOf (ops : CheckerOps) (env : FEnv) (p : BlockShape) (formerTys : Li
   let kinds ← classFieldsOf p ctor.1.name ihs 0 fvs
   classFieldsAgree ops env p formerTys Ms fvs ctor.1.name E 0 kinds
   let M := Ms.getD c default
-  let tyD ← unwrapOr (instPisWith M.ds (targetCtorAt M ctor.1))
+  let tyD ← unwrapOr (instPisWith M.ds (← targetCtorAt M ctor.1))
     (.internal "generated recursor: constructor parameter telescope")
   pure ⟨ctor.1, ctor.2, kinds, tyD, e0.ty⟩
 
@@ -277,13 +277,15 @@ def classFormerTy (ops : CheckerOps) (fe : FEnv) (formers : List ConstantVal) (M
   | none => match fe.indView? M.ind with
     | some (cv, caps) => do
       let ty ← familyTelescope ops fe cv caps
-      pure (ty.instLvlParamsI cv.levelParams M.lvls)
+      instLevelParamsM cv.levelParams M.lvls ty
     | none => throw (.internal "generated recursor: a class's former vanished")
 
-/-- Twin of `classConstOk`. -/
+/-- Twin of `classConstOk`; the name's freshness read off the environment
+itself (`checkConstantValF`).  The generated type was closed by depth
+(`EO.abstractDepthsFrom`), which may write `EO.rangePoison`: a type
+`EO.inRange` refuses is an error, as in `reducedFormer`. -/
 def classConstOk (ops : CheckerOps) (fe : FEnv) (cv : ConstantVal) : CheckCM Unit := do
-  if (fe.find? cv.name).isSome then throw (.invalid s!"duplicate declaration {cv.name}")
-  if reservedBasisNames.contains cv.name then throw (.invalid s!"reserved basis name {cv.name}")
+  if (fe.env.find? cv.name).isSome then throw (alreadyDeclared cv.name)
   unless litShapeOk cv.name cv.levelParams cv.type do
     throw (.notImplemented s!"a declaration at a literal's name with another shape ({cv.name})")
   unless namesNodup cv.levelParams do
@@ -292,10 +294,11 @@ def classConstOk (ops : CheckerOps) (fe : FEnv) (cv : ConstantVal) : CheckCM Uni
     throw (.internal s!"generated recursor: loose bound variable in type of {cv.name}")
   if cv.type.hasFVar then
     throw (.internal s!"generated recursor: free variable in type of {cv.name}")
+  unless EO.inRange cv.type do throw (.internal "too many bound variables")
   unless ← allLevelParamsDefined cv.levelParams cv.type do
     throw (.invalid s!"undeclared universe parameter in type of {cv.name}")
   unless ← constsResolveF fe cv.type do
-    throw (unresolvedConstsErrorL true s!"type of {cv.name}" cv.type)
+    throw (unresolvedConstsErrorL fe true s!"type of {cv.name}" cv.type)
   let stype ← ops.inferType fe 0 cv.type
   let _u ← ops.ensureSort fe 0 stype
 
@@ -330,22 +333,24 @@ def classRecTysOk (ops : CheckerOps) (fe : FEnv) (g : ClassGen) (k : Nat) :
   | [], _, _ => pure []
   | _, _, _ => throw (.internal "generated recursor: recursor list")
 
-/-- Twin of `classRuleCheck`. -/
+/-- Twin of `classRuleCheck`; a rule `EO.inRange` refuses is an error, as in
+`classConstOk`. -/
 def classRuleCheck (ops : CheckerOps) (w : StructWalkers) (feT feR : FEnv) (cvR : ConstantVal)
     (n : Nat) (gen : Expr) : CheckCM Unit := do
   unless !gen.hasLooseBVars && !gen.hasFVar do
     throw (.internal s!"generated recursor: a rule of {cvR.name} is not closed")
+  unless EO.inRange gen do throw (.internal "too many bound variables")
   unless ← allLevelParamsDefined cvR.levelParams gen do
     throw (.internal s!"generated recursor: a rule of {cvR.name} names an undeclared universe \
       parameter")
   unless ← w.resolve feR gen do
-    throw (unresolvedConstsErrorL true s!"generated rule of {cvR.name}" gen)
+    throw (unresolvedConstsErrorL feR true s!"generated rule of {cvR.name}" gen)
   let _ ← ops.inferType feR 0 gen
   let (rbs, _) ← unwrapOr (stripLams n gen)
     (.internal s!"generated recursor: a rule of {cvR.name} is not a λ-telescope over the \
       recursor's prefix and the constructor's fields")
   unless ← rbs.allM (w.resolve feT) do
-    throw (unresolvedConstsErrorL true s!"the domains of a generated rule of {cvR.name}" gen)
+    throw (unresolvedConstsErrorL feT true s!"the domains of a generated rule of {cvR.name}" gen)
 
 /-- Twin of `classRuleOk`. -/
 def classRuleOk (ops : CheckerOps) (w : StructWalkers) (feT feR : FEnv) (cvR : ConstantVal)

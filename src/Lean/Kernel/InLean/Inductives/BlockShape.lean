@@ -10,16 +10,16 @@ prelude
 public import Lean.Kernel.InLean.CheckerC
 
 /-!
-# InLean's inductive check: the vocabulary and the recogniser
+# InLean's inductive check: the vocabulary and the reader
 
-Twins of `ConLeche/Kernel/Inductives/BlockShape.lean` (the block's
-recogniser and its records), the parts of `FieldTele.lean`,
-`Positivity.lean` and `ConLeche/Kernel/ExprOps.lean` the block check reads
+Twins of `ConLeche.Kernel.Inductives.BlockShape` (the block's
+reader and its records), the parts of `ConLeche.Kernel.Inductives.FieldTele`,
+`ConLeche.Kernel.Inductives.Positivity` and `ConLeche.Kernel.ExprOps` the block check reads
 (telescopes, the free-variable walks), and `CheckerOps`.
 
 A block is a list of Lean constants (`inductInfo`, `ctorInfo`, `recInfo`, in
 that order), the twin of the stream's records: the inductive generator's
-output (`Lean/Kernel/InLean/IndGen.lean`).
+output (`Lean.Kernel.InLean.IndGen`).
 
 **Free variables.**  con-leche builds `.fvar i ty` purely; here building one
 interns it (`mkFVarM`), so a function that opens a telescope is in `CheckCM`.
@@ -55,16 +55,19 @@ def unwrapOr (o : Option α) (err : CheckError) : CheckCM α :=
 def stripPis : Nat → Expr → Option (List Expr × Expr)
   | 0, e => some ([], e)
   | n + 1, .forallE _ d b _ => (stripPis n b).map fun (ds, r) => (d :: ds, r)
+  | n + 1, .mdata _ e => stripPis (n + 1) e
   | _ + 1, _ => none
 
 /-- Twin of `Expr.stripLams`. -/
 def stripLams : Nat → Expr → Option (List Expr × Expr)
   | 0, e => some ([], e)
   | n + 1, .lam _ d b _ => (stripLams n b).map fun (ds, r) => (d :: ds, r)
+  | n + 1, .mdata _ e => stripLams (n + 1) e
   | _ + 1, _ => none
 
 /-- Twin of `Expr.piBinders`. -/
 def piBinders : Expr → List Expr × Expr
+  | .mdata _ e => piBinders e
   | .forallE _ ty b _ =>
     let (bs, e) := piBinders b
     (ty :: bs, e)
@@ -79,6 +82,7 @@ def mkPisOf : List Expr → Expr → Expr
 def instPisWith : List Expr → Expr → Option Expr
   | [], e => some e
   | a :: as, .forallE _ _ body _ => instPisWith as (body.inst1I a)
+  | a :: as, .mdata _ e => instPisWith (a :: as) e
   | _ :: _, _ => none
 
 /-- Twin of `Expr.instPisAtLift`. -/
@@ -88,6 +92,7 @@ def instPisAtLift : List Expr → Expr → Option Expr := instPisWith
 def targetPiDomsWith : List Expr → Expr → Option (List Expr)
   | [], _ => some []
   | x :: xs, .forallE _ d b _ => (d :: ·) <$> targetPiDomsWith xs (b.inst1I x)
+  | x :: xs, .mdata _ e => targetPiDomsWith (x :: xs) e
   | _ :: _, _ => none
 
 /-- Twin of `Expr.mkAppN` on a list. -/
@@ -102,7 +107,7 @@ def openPisAtFvars : Nat → Expr → Nat → CheckCM (Option (List Expr × Expr
 
 /-- Twin of `Expr.fvarTypeD`. -/
 def fvarTypeD (x : Expr) : CheckCM Expr := do
-  match x with
+  match EO.stripTop (x) with
   | .fvar id => return (← fvarTypeM? id).getD default
   | _ => return default
 
@@ -208,16 +213,17 @@ def litGuardNames : List Name :=
 
 /-- Twin of `reservedRecName`. -/
 def reservedRecName (n : Name) : Bool :=
-  reservedBasisNames.contains n || litGuardNames.contains n ||
+  litGuardNames.contains n ||
     natOpNames.contains n || natDivModNames.contains n ||
     n == boolName || n == boolTrueName || n == boolFalseName
 
 /-- Twin of `memberIdxAt?`. -/
 def memberIdxAt? (names : List Name) (lvls : List Level) : Expr → Option Nat
+  | .mdata _ e => memberIdxAt? names lvls e
   | .const n us => if us == lvls then names.findIdx? (· == n) else none
   | _ => none
 
-/-! ## The record (twin of `BlockShape.lean`) -/
+/-! ## The record (twin of `ConLeche.Kernel.Inductives.BlockShape`) -/
 
 /-- Twin of `MemberShape`. -/
 structure MemberShape where
@@ -312,32 +318,40 @@ def blockSplit : List ConstantInfo →
 
 /-- Twin of `recTargetOf`. -/
 def recTargetOf (names : List Name) (mI : Nat) (ty : Expr) : Nat :=
-  match stripPis mI ty with
-  | some (_, .forallE _ dom _ _) =>
-    (match dom.getAppFn with
+  match (stripPis mI ty).map (fun (p : List Expr × Expr) => EO.stripTop p.2) with
+  | some (.forallE _ dom _ _) =>
+    (match dom.getAppFnT with
      | .const n _ => names.findIdx? (· == n)
      | _ => none).getD names.length
   | _ => names.length
 
-/-- Twin of `blockCounts?`. -/
-def blockCounts? (nPd k nC nR : Nat) (cvT : ConstantVal) (r : Option (Nat × Nat)) :
-    Option (Nat × Nat) :=
+/-- Twin of `blockCounts`. -/
+def blockCounts (nPd k nC nR : Nat) (cvT : ConstantVal) (r : Option (Name × Nat × Nat)) :
+    Except CheckError (Nat × Nat) :=
   match piBinders cvT.type with
-  | (bs, .sort _) => if nPd ≤ bs.length then some (nPd, bs.length - nPd) else none
+  | (bs, .sort _) =>
+    if nPd ≤ bs.length then .ok (nPd, bs.length - nPd)
+    else .error (.invalid s!"inductive type {cvT.name} declares {nPd} parameters, \
+      but its type has {bs.length} binders")
   | _ =>
     match r with
-    | none => none
-    | some (mI, rP) =>
-      if rP < nC + k || mI < rP then none
-      else if rP - (nC + k) == nPd then some (nPd, mI - rP)
-      else if k < nR && nPd + nR + nC ≤ rP then some (nPd, mI - rP)
-      else none
+    | none => .error (.invalid s!"no recursor of the block eliminates {cvT.name}")
+    | some (rn, mI, rP) =>
+      if rP < nC + k || mI < rP then .error (recCountsError rn cvT.name k nC nPd)
+      else if rP - (nC + k) == nPd then .ok (nPd, mI - rP)
+      else if k < nR && nPd + nR + nC ≤ rP then .ok (nPd, mI - rP)
+      else .error (recCountsError rn cvT.name k nC nPd)
+where
+  /-- A recursor whose argument counts do not fit the block. -/
+  recCountsError (rn T : Name) (k nC nPd : Nat) : CheckError :=
+    .invalid s!"the argument counts of recursor {rn} do not fit the block of {T} \
+      ({k} inductive types, {nC} constructors, {nPd} parameters)"
 
 /-- Twin of `ctorMember?`. -/
 def ctorMember? (names : List Name) (lps : List Name) (nP : Nat) (c : ConstantVal × Nat) :
     Option Nat :=
   match stripPis (nP + c.2) c.1.type with
-  | some (_, cbody) => memberIdxAt? names (lps.map .param) cbody.getAppFn
+  | some (_, cbody) => memberIdxAt? names (lps.map .param) cbody.getAppFnT
   | none => none
 
 /-- Twin of `blockGroups`. -/
@@ -362,19 +376,20 @@ def blockRecNameSetOk (p : BlockShape) : Bool :=
 def blockRecNamesUnreserved (p : BlockShape) : Bool :=
   p.recs.all fun rc => reservedRecName rc.cvR.name == false
 
-/-- Twin of `blockMemberCounts?`. -/
-def blockMemberCounts? (nPd k nC : Nat) (names : List Name) (rs : List RecParts) :
-    Nat → List ConstantVal → Option (List Nat)
-  | _, [] => some []
+/-- Twin of `blockMemberCounts`. -/
+def blockMemberCounts (nPd k nC : Nat) (names : List Name) (rs : List RecParts) :
+    Nat → List ConstantVal → Except CheckError (List Nat)
+  | _, [] => .ok []
   | m, cvT :: ts =>
     let r := (rs.find? fun q => recTargetOf names q.2.1 q.1.type == m).map
-      fun q => (q.2.1, q.2.2.1)
-    match blockCounts? nPd k nC rs.length cvT r with
-    | some c => (blockMemberCounts? nPd k nC names rs (m + 1) ts).map fun ns => c.2 :: ns
-    | none => none
+      fun q => (q.1.name, q.2.1, q.2.2.1)
+    match blockCounts nPd k nC rs.length cvT r with
+    | .ok c => (blockMemberCounts nPd k nC names rs (m + 1) ts).map fun ns => c.2 :: ns
+    | .error e => .error e
 
-/-- Twin of `blockShape?`. -/
-def blockShape? (nPd : Nat) (block : List ConstantInfo) : Option BlockShape :=
+/-- Twin of `readBlock`. -/
+def readBlock (nPd : Nat) (block : List ConstantInfo) : Except CheckError BlockShape :=
+  let head := (block.head?.map (·.name)).getD .anonymous
   match blockSplit block with
   | some (cvTs, cs, rs) =>
     match cvTs, rs with
@@ -382,17 +397,28 @@ def blockShape? (nPd : Nat) (block : List ConstantInfo) : Option BlockShape :=
       let lps := cvT0.levelParams
       let names := cvTs.map (·.name)
       let k := cvTs.length
-      match blockMemberCounts? nPd k cs.length names rs 0 cvTs with
-      | none => none
-      | some nIdxs =>
+      match blockMemberCounts nPd k cs.length names rs 0 cvTs with
+      | .error e => .error e
+      | .ok nIdxs =>
         let nP := nPd
-        if (cvTs.all fun c => reservedBasisNames.contains c.name == false) &&
-            (rs.all fun r => reservedBasisNames.contains r.1.name == false) &&
-            (cvTs.all fun c => c.levelParams == lps) &&
-            cs.all (fun c => c.2.1 == nP && c.1.levelParams == lps &&
-              reservedBasisNames.contains c.1.name == false) then
-          let s : Level := match stripPis (nP + nIdxs.headD 0) cvT0.type with
-            | some (_, .sort s) => s
+        match cvTs.find? (fun c => c.levelParams != lps) with
+        | some c => .error (.invalid s!"inductive type {c.name} declares universe parameters \
+            {c.levelParams}, but {cvT0.name} declares {lps}")
+        | none =>
+        match cs.find? (fun c => c.2.1 != nP) with
+        | some c => .error (.invalid s!"constructor {c.1.name} declares {c.2.1} parameters, \
+            but the block declares {nP}")
+        | none =>
+        match cs.find? (fun c => c.1.levelParams != lps) with
+        | some c =>
+          let owner := if k == 1 then s!"its type {cvT0.name} declares"
+            else "the block's inductive types declare"
+          .error (.invalid s!"constructor {c.1.name} declares universe parameters \
+            {c.1.levelParams}, but {owner} {lps}")
+        | none =>
+          let s : Level := match (stripPis (nP + nIdxs.headD 0) cvT0.type).map
+              (fun (p : List Expr × Expr) => EO.stripTop p.2) with
+            | some (.sort s) => s
             | _ => .zero
           let isProp := Lvl.isEquiv s .zero == some true
           let ctors : List (ConstantVal × Nat) := cs.map fun c => (c.1, c.2.2)
@@ -407,14 +433,17 @@ def blockShape? (nPd : Nat) (block : List ConstantInfo) : Option BlockShape :=
             | elim :: relps => if relps == lps && !lps.contains elim then some elim else none
             | [] => none
           match large? with
-          | some elim => some ⟨members, recsL, nP, elim, s, true, isProp⟩
-          | none => some ⟨members, recsL, nP, .anonymous, s, false, isProp⟩
-        else none
-    | _, _ => none
-  | none => none
+          | some elim => .ok ⟨members, recsL, nP, elim, s, true, isProp⟩
+          | none => .ok ⟨members, recsL, nP, .anonymous, s, false, isProp⟩
+    | [], _ => .error (.invalid s!"inductive block {head} declares no inductive type")
+    | _ :: _, [] => .error (.invalid s!"inductive block {head} carries no recursor records; \
+        the input must carry the recursors of every inductive block")
+  | none => .error (.invalid s!"inductive block {head}: its records are not the inductive \
+      types, then the constructors, then the recursors")
 
 /-- Twin of `Expr.piSortTeleLen?`. -/
 def piSortTeleLen? : Expr → Option Nat
+  | .mdata _ e => piSortTeleLen? e
   | .forallE _ _ body _ => (piSortTeleLen? body).map (· + 1)
   | .sort _ => some 0
   | _ => none

@@ -9,13 +9,15 @@ prelude
 
 public import Lean.Data.Json
 public import Lean.Kernel.InLean.Basic
+public import Lean.Kernel.InLean.ExprOps
 
 /-!
 # InLean: the Nat-operation pin variants
 
-InLean embeds the **same dumps** con-leche splices (`pins/<toolchain>.json`, `ConLeche/Kernel/NatOpPins.lean`,
+InLean does not import ConLeche, so it embeds the **same dumps**
+con-leche splices (one JSON file per toolchain, `ConLeche.Kernel.NatOpPins`,
 in the same order) with `include_str`, and decodes their share tables
-(`ConLeche/PinGen/Dump.lean`'s encoding) into `Lean.Expr` when a
+(`ConLeche.PinGen.Dump`'s encoding) into `Lean.Expr` when a
 pin-certified operation is declared — eight times per run, so the decode
 is not memoised.  Binder names are anonymous: the pins are compared by
 definitional equality.  Nothing here is generated from the compiling
@@ -44,6 +46,13 @@ structure PinSet where
 
 def PinSet.op? (ps : PinSet) (c : Name) : Option PinOp :=
   ps.ops.find? (·.op == c)
+
+/-- Every term of one operation's pin data is in range (`EO.inRange`). -/
+def PinOp.inRange (op : PinOp) : Bool :=
+  EO.inRange op.pin && op.proofs.all EO.inRange && op.typePins.all (EO.inRange ·.2)
+
+/-- Every term of a variant is in range. -/
+def PinSet.inRange (ps : PinSet) : Bool := ps.ops.all PinOp.inRange
 
 namespace PinDecode
 
@@ -93,7 +102,7 @@ def entry (tab : Array Obj) (j : Json) : Except String Obj := do
   | "lM" => return .level (.max (← refLevel tab (← at? 1)) (← refLevel tab (← at? 2)))
   | "lI" => return .level (.imax (← refLevel tab (← at? 1)) (← refLevel tab (← at? 2)))
   | "lp" => return .level (.param (← refName tab (← at? 1)))
-  | "b" => return .expr (.bvar (← (← at? 1).getNat?))
+  | "b" => return .expr (mkBvar (← (← at? 1).getNat?))
   | "s" => return .expr (.sort (← refLevel tab (← at? 1)))
   | "c" =>
     let us ← (← at? 2).getArr?
@@ -131,7 +140,7 @@ def pinSet (s : String) : Except String PinSet := do
 
 end PinDecode
 
-/-- The committed dumps, in con-leche's order (the repository toolchain's
+/-- The dumps, in con-leche's order (the dump of con-leche's toolchain
 first). -/
 def pinDumpTexts : Array String := #[
   include_str "pins/leanprover-lean4-nightly-nightly-2026-09-10.json",
@@ -140,7 +149,9 @@ def pinDumpTexts : Array String := #[
 
 /-- Decode the pin variants (at use: a function, so nothing runs at
 process start). -/
-def loadPinSets (_ : Unit) : Except String (Array PinSet) :=
-  pinDumpTexts.mapM PinDecode.pinSet
+def loadPinSets (_ : Unit) : Except String (Array PinSet) := do
+  let sets ← pinDumpTexts.mapM PinDecode.pinSet
+  unless sets.all PinSet.inRange do throw "a pin dump term is out of range"
+  return sets
 
 end Lean.Kernel.InLean

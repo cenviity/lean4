@@ -139,14 +139,14 @@ def elabAddDeclExport (env : Lean.Environment) (maxHeartbeats : USize) (maxRecDe
     (decl : Declaration) (cancelTk? : Option IO.CancelToken) :
     Except Kernel.Exception Lean.Environment := do
   let kenv ← addDeclExport env.toKernelEnv maxHeartbeats maxRecDepth decl cancelTk?
-  return env.updateBaseAfterKernelAdd kenv decl
+  return env.updateBaseAfterKernelAdd kenv
 
 /-- `Environment.addDeclWithoutChecking` (`lean_elab_add_decl_without_checking`). -/
 @[export lean_elab_add_decl_without_checking]
 def elabAddDeclWithoutCheckingExport (env : Lean.Environment) (decl : Declaration) :
     Except Kernel.Exception Lean.Environment := do
   let kenv ← addDeclWithoutCheckingExport env.toKernelEnv decl
-  return env.updateBaseAfterKernelAdd kenv decl
+  return env.updateBaseAfterKernelAdd kenv
 
 /-- Open a local context: each local declaration in order becomes an interned free variable at its
 depth, a `let` local is replaced by its value.  Returns the substitution (original free variables

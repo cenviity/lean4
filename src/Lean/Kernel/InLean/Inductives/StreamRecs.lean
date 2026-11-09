@@ -12,7 +12,7 @@ public import Lean.Kernel.InLean.Inductives.GenRec
 /-!
 # InLean's inductive check: the stream's recursors against the generated ones
 
-Twin of `ConLeche/Kernel/Inductives/StreamRecs.lean`: each recursor the block
+Twin of `ConLeche.Kernel.Inductives.StreamRecs`: each recursor the block
 declares compared with the one generated from its classes (type, rules, firing
 data and K flag).
 -/
@@ -87,14 +87,14 @@ def streamNestedOk (ty : Expr) (mI rP : Nat) : RecRuleFire → Bool
   | .plain => true
   | .levels _ => true
   | .nested lvls pins =>
-    match stripPis mI ty with
-    | some (_, .forallE _ dom _ _) =>
-      (match dom.getAppFn with
+    match (stripPis mI ty).map (fun (p : List Expr × Expr) => EO.stripTop p.2) with
+    | some (.forallE _ dom _ _) =>
+      (match dom.getAppFnT with
        | .const _ us => us == lvls
        | _ => false) &&
       appArgs dom ==
         pins.map (EO.liftLooseBVars · 0 (mI - rP)) ++
-          (List.range (mI - rP)).map (fun i => Expr.bvar (mI - rP - 1 - i))
+          (List.range (mI - rP)).map (fun i => mkBvar (mI - rP - 1 - i))
     | _ => false
 
 /-- Twin of `generatedFire`. -/

@@ -14,31 +14,29 @@ import all Init.Util
 /-!
 # InLean: the expression operations, in Lean
 
-Core's opaque
-C++ operations — `instantiate`, `instantiate1`, `instantiateRev(Range)`,
+Core's opaque C++ operations — `instantiate`, `instantiate1`, `instantiateRev(Range)`,
 `abstract(Range)`, `lift`/`lowerLooseBVars`, `hasLooseBVar`, and the
 `implemented_by` traversals (`Expr.replace`, `Expr.find?`,
 `collectFVars`, `getUsedConstants`, the level-parameter collector) — are
 replaced by Lean-defined, memoised structural walks: twins of
-`ConLeche/Cached/ExprOpsC.lean`'s substitutions (`instantiate1C`,
+`ConLeche.Cached.ExprOpsC`'s substitutions (`instantiate1C`,
 `instantiateListC`, `instantiateRev`, `abstract1C`, `abstractRangeC`,
 `instLevelParams`) over `Lean.Expr`'s six binder-bearing constructors.
 
-**The memo.**  con-leche's walks memoise exactly the nodes the runtime
-reports shared (`withExclusive`, its one `unsafe`-implemented primitive);
-InLean may add no `unsafe` code, so every compound node is memoised, keyed
-by the node and the binder offset under the lawful pointer-first equality
-(`Lean/Kernel/InLean/ExprEq.lean`) — a structural recursion, no fuel needed.
+**The memo** is con-leche's: a walk memoises exactly the nodes the runtime
+reports shared (`withIsExclusive`), keyed by address and
+binder offset, every entry carrying its own proof against the plain
+descent (`mapP`, `anyP`) — a structural recursion, no fuel needed.
 
 **The cutoffs** read Lean's cached fields (`looseBVarRange`, `hasFVar`,
 `hasLevelParam`), as con-leche's read its computed `data` word.  Lean
-computes them in C; the Lean bodies of `Expr.mkData`, `Expr.mkAppData` and
-`Level.mkData` state what C computes.  Lean does not
+computes them in C (`Expr.mkData`, `Expr.mkAppData`, `Level.mkData`); the
+proof relates them to the term by what C computes, on terms in range.  Lean does not
 saturate the range: a node above `2^20 - 1` loose variables aborts the
 process ("too many bound variables").  So the one walk here that can grow
 indices past a term's own, `abstract`, writes `rangePoison` instead of an
 out-of-range `bvar`, and its checker call sites error on it in O(1)
-(`InLean.abstractChecked`, `State.lean`).
+(`abstractRangeM`, `Lean.Kernel.InLean.StateC`).
 -/
 
 @[expose] public section
@@ -88,53 +86,250 @@ def depth : Level → Nat
 
 end Lvl
 
+/-! ## The shared `bvar` pool (twin of `ConLeche.Expr.bvarPool`)
+
+`bvarPool` is one static table of the first `bvarPoolSize` `bvar` nodes: a
+closed top-level `def`, built once at module initialization and marked
+persistent, so handing out `bvarPool[i]` costs a bounds check and a
+borrowed read, with no allocation and no reference counting.  `mkBvar` is
+the runtime `bvar` builder of the walks and decoders; it is
+representation-transparent (`mkBvar_eq`, `@[simp]`).  Closed constants
+such as `.bvar 0` keep the bare constructor: the compiler already lifts
+them to persistent closed terms. -/
+
+/-- Size of the static `bvar` pool. -/
+def bvarPoolSize : Nat := 4096
+
+@[inherit_doc bvarPoolSize]
+def bvarPool : Array Expr := (Array.range bvarPoolSize).map Expr.bvar
+
+/-- The `bvar` smart constructor: the pooled node below `bvarPoolSize`,
+a fresh one above it.  Same value either way (`mkBvar_eq`). -/
+@[inline] def mkBvar (i : Nat) : Expr :=
+  if h : i < bvarPool.size then bvarPool[i] else .bvar i
+
+@[simp] theorem mkBvar_eq (i : Nat) : mkBvar i = .bvar i := by
+  unfold mkBvar
+  split
+  · simp [bvarPool]
+  · rfl
+
 namespace EO
+
+/- The walks' memos compare nodes exactly: a walk's result keeps the binder
+names of its input (the generator's output must equal the official
+constants). -/
+attribute [local instance 2000] instBEqExprExact
 
 /-- The memo of a walk: node and offset to result. -/
 abbrev Memo := Std.HashMap (Expr × Nat) Expr
+
+/-- A walk's own empty memo, sized by the term's depth: an allocation of the
+walk's own, so its first insert writes in place (a closed `{}` is one
+shared constant, whose first insert copies the bucket array). -/
+@[inline] def freshFor {α β : Type} [BEq α] [Hashable α] (e : Expr) : Std.HashMap α β :=
+  Std.HashMap.emptyWithCapacity (e.approxDepth.toNat + 8)
 
 @[inline] def isCompound : Expr → Bool
   | .app .. | .lam .. | .forallE .. | .letE .. | .mdata .. | .proj .. => true
   | _ => false
 
-/-- **The memoised offset map**: `f e k` decides a node (`some r`) or
-lets the walk descend; every compound node's result is memoised under
-`(node, offset)`.  Structural. -/
-def mapOff (f : Expr → Nat → Option Expr) : Expr → Nat → Memo → Expr × Memo
-  | e, k, memo =>
-    match f e k with
-    | some r => (r, memo)
-    | none =>
-      if !isCompound e then (e, memo) else
-      match memo[(e, k)]? with
-      | some r => (r, memo)
-      | none =>
-        let (r, memo) : Expr × Memo := match e with
-          | .app g a =>
-            let (g', memo) := mapOff f g k memo
-            let (a', memo) := mapOff f a k memo
-            (e.updateApp! g' a', memo)
-          | .lam _ t b _ =>
-            let (t', memo) := mapOff f t k memo
-            let (b', memo) := mapOff f b (k + 1) memo
-            (e.updateLambdaE! t' b', memo)
-          | .forallE _ t b _ =>
-            let (t', memo) := mapOff f t k memo
-            let (b', memo) := mapOff f b (k + 1) memo
-            (e.updateForallE! t' b', memo)
-          | .letE _ t v b _ =>
-            let (t', memo) := mapOff f t k memo
-            let (v', memo) := mapOff f v k memo
-            let (b', memo) := mapOff f b (k + 1) memo
-            (e.updateLetE! t' v' b', memo)
-          | .mdata _ x =>
-            let (x', memo) := mapOff f x k memo
-            (e.updateMData! x', memo)
-          | .proj _ _ x =>
-            let (x', memo) := mapOff f x k memo
-            (e.updateProj! x', memo)
-          | _ => (e, memo)
-        (r, memo.insert (e, k) r)
+/-! ### The memo of the walks
+
+con-leche's discipline (`ConLeche.Cached.ExprOpsC`, "The substitution
+walks"): at every compound node past the cutoff the walk asks
+`withIsExclusive` whether the node is exclusive; an
+exclusive node cannot be reached twice and is descended with the memo
+untouched, a shared one is probed and, on a miss, recorded.  The key is the
+node's address packed with the binder offset (`pkey`), the table is created
+at the first shared node, and an entry carries its node, its offset, its
+value and the proof, so a hit is believed only after the pointer test
+(`ptrDec`) and there is no table invariant.  The walks return a `Squash` of
+the value with its proof against the plain descent beside the memo, so the
+obligations of `withIsExclusive` and `withPtrAddr` are `Subsingleton.elim`. -/
+
+/-- The packed key: the address over its 8-byte alignment, then the offset
+modulo `2^16` in the low bits. -/
+@[inline] def pkey (addr : USize) (c : Nat) : Nat :=
+  (addr.toUInt64 / 8 * 65536 + (UInt64.ofNat c &&& 65535)).toNat
+
+/-- A memo entry: the node, the offset, the value and its proof. -/
+structure PEnt {β : Type} (s : Expr → Nat → β) where
+  node : Expr
+  depth : Nat
+  val : β
+  eq : val = s node depth
+
+/-- A validated hit: the offsets compare equal and the stored node IS the
+current one (by pointer at runtime). -/
+@[inline] def PEnt.hit {β : Type} {s : Expr → Nat → β} {γ : Sort u} (p : PEnt s) (e : Expr)
+    (c : Nat) (k : { r : β // r = s e c } → γ) (miss : Unit → γ) : γ :=
+  if hd : p.depth = c then
+    match ptrDec p.node e with
+    | isTrue hn => k ⟨p.val, by rw [p.eq, hn, hd]⟩
+    | isFalse _ => miss ()
+  else miss ()
+
+/-- The table's key: the packed `Nat` under a mixing hash. -/
+structure PKey where
+  val : Nat
+
+instance : BEq PKey := ⟨fun a b => a.val == b.val⟩
+instance : Hashable PKey := ⟨fun k => hash64 (UInt64.ofNat k.val)⟩
+
+/-- The pointer-keyed memo: absent until the first shared compound node. -/
+abbrev MemoXP {β : Type} (s : Expr → Nat → β) := Option (Std.HashMap PKey (PEnt s))
+
+/-- A walk's result: the value, fixed by its proof, beside the memo. -/
+abbrev ResXP {β : Type} (s : Expr → Nat → β) (e : Expr) (c : Nat) :=
+  { r : β // r = s e c } × MemoXP s
+
+@[inline] def MemoXP.insert {β : Type} {s : Expr → Nat → β} (memo : MemoXP s) (key : Nat)
+    (p : PEnt s) : MemoXP s :=
+  match memo with
+  | none => some (({} : Std.HashMap PKey (PEnt s)).insert ⟨key⟩ p)
+  | some m => some (m.insert ⟨key⟩ p)
+
+/-- The shared-node step: the address read, the probe, the validated hit —
+else the descent and the record under the key read before it. -/
+@[inline] def MemoXP.shared {β : Type} {s : Expr → Nat → β} (memo : MemoXP s) (e : Expr)
+    (c : Nat) (rec : Unit → Squash (ResXP s e c)) : Squash (ResXP s e c) :=
+  withAddr e fun addr =>
+  let key := pkey addr c
+  match memo with
+  | none => Squash.lift (rec ()) fun (⟨r, hr⟩, memo) =>
+      Squash.mk (⟨r, hr⟩, memo.insert key ⟨e, c, r, hr⟩)
+  | some m =>
+    match m[(⟨key⟩ : PKey)]? with
+    | some p => p.hit e c (fun r => Squash.mk (r, memo)) fun _ =>
+        Squash.lift (rec ()) fun (⟨r, hr⟩, memo) =>
+          Squash.mk (⟨r, hr⟩, memo.insert key ⟨e, c, r, hr⟩)
+    | none => Squash.lift (rec ()) fun (⟨r, hr⟩, memo) =>
+        Squash.mk (⟨r, hr⟩, memo.insert key ⟨e, c, r, hr⟩)
+
+/-- The value of a walk's result (fixed by its subtype). -/
+@[inline] def resVal {β : Type} {c : β} {M : Type} (s : Squash ({ r : β // r = c } × M)) : β :=
+  Quotient.lift (fun p => p.1.1) (fun p q _ => by rw [p.1.2, q.1.2]) s
+
+theorem resVal_eq {β : Type} {c : β} {M : Type} (s : Squash ({ r : β // r = c } × M)) :
+    resVal s = c := by
+  induction s using Quotient.ind with
+  | _ p => exact p.1.2
+
+/-! ### The offset map -/
+
+/-- **The plain offset map**: `f e k` decides a node (`some r`), or the map
+rebuilds it from its mapped children (offset `+1` under a binder). -/
+def mapP (f : Expr → Nat → Option Expr) (e : Expr) (k : Nat) : Expr :=
+  match f e k with
+  | some r => r
+  | none =>
+    match e with
+    | .app g a => e.updateApp! (mapP f g k) (mapP f a k)
+    | .lam _ t b _ => e.updateLambdaE! (mapP f t k) (mapP f b (k + 1))
+    | .forallE _ t b _ => e.updateForallE! (mapP f t k) (mapP f b (k + 1))
+    | .letE _ t v b _ => e.updateLetE! (mapP f t k) (mapP f v k) (mapP f b (k + 1))
+    | .mdata _ x => e.updateMData! (mapP f x k)
+    | .proj _ _ x => e.updateProj! (mapP f x k)
+    | _ => e
+
+theorem mapP_some {f : Expr → Nat → Option Expr} {e : Expr} {k : Nat} {r : Expr}
+    (h : f e k = some r) : mapP f e k = r := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_leaf {f : Expr → Nat → Option Expr} {e : Expr} {k : Nat}
+    (h : f e k = none) (hc : isCompound e = false) : mapP f e k = e := by
+  rw [mapP.eq_def, h]; cases e <;> simp_all [isCompound]
+
+theorem mapP_app {f : Expr → Nat → Option Expr} {g a : Expr} {k : Nat} (h : f (.app g a) k = none) :
+    mapP f (.app g a) k = (Expr.app g a).updateApp! (mapP f g k) (mapP f a k) := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_lam {f : Expr → Nat → Option Expr} {n t b bi} {k : Nat}
+    (h : f (.lam n t b bi) k = none) :
+    mapP f (.lam n t b bi) k = (Expr.lam n t b bi).updateLambdaE! (mapP f t k) (mapP f b (k + 1)) := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_forallE {f : Expr → Nat → Option Expr} {n t b bi} {k : Nat}
+    (h : f (.forallE n t b bi) k = none) :
+    mapP f (.forallE n t b bi) k
+      = (Expr.forallE n t b bi).updateForallE! (mapP f t k) (mapP f b (k + 1)) := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_letE {f : Expr → Nat → Option Expr} {n t v b nd} {k : Nat}
+    (h : f (.letE n t v b nd) k = none) :
+    mapP f (.letE n t v b nd) k
+      = (Expr.letE n t v b nd).updateLetE! (mapP f t k) (mapP f v k) (mapP f b (k + 1)) := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_mdata {f : Expr → Nat → Option Expr} {m x} {k : Nat} (h : f (.mdata m x) k = none) :
+    mapP f (.mdata m x) k = (Expr.mdata m x).updateMData! (mapP f x k) := by
+  rw [mapP.eq_def, h]
+
+theorem mapP_proj {f : Expr → Nat → Option Expr} {sn i x} {k : Nat} (h : f (.proj sn i x) k = none) :
+    mapP f (.proj sn i x) k = (Expr.proj sn i x).updateProj! (mapP f x k) := by
+  rw [mapP.eq_def, h]
+
+/-- The child step of `mapX`: the callback (the cutoff), the compound test,
+the exclusivity read. -/
+@[inline] def enterMap (f : Expr → Nat → Option Expr) (memo : MemoXP (mapP f)) (e : @& Expr)
+    (k : Nat) (rec : f e k = none → isCompound e = true → Squash (ResXP (mapP f) e k)) :
+    Squash (ResXP (mapP f) e k) :=
+  match h : f e k with
+  | some r => Squash.mk (⟨r, (mapP_some h).symm⟩, memo)
+  | none =>
+    if hc : isCompound e then withExcl e fun excl =>
+      if excl then rec h hc else memo.shared e k fun _ => rec h hc
+    else Squash.mk (⟨e, (mapP_leaf h (by simpa using hc)).symm⟩, memo)
+
+/-- **The memoised offset map**: the walk of `mapP f`, its node past the
+callback. -/
+@[specialize] def mapX (f : Expr → Nat → Option Expr) (memo : MemoXP (mapP f)) (e : @& Expr)
+    (k : Nat) (h : f e k = none) (hc : isCompound e = true) :
+    Squash (ResXP (mapP f) e k) :=
+  match he : e with
+  | .app g a =>
+    enterMap f memo g k (fun h hc => mapX f memo g k h hc) |>.lift fun (⟨g', hg⟩, memo) =>
+    enterMap f memo a k (fun h hc => mapX f memo a k h hc) |>.lift fun (⟨a', ha⟩, memo) =>
+    Squash.mk (⟨e.updateApp! g' a', by rw [he, mapP_app h, hg, ha]⟩, memo)
+  | .lam _ t b _ =>
+    enterMap f memo t k (fun h hc => mapX f memo t k h hc) |>.lift fun (⟨t', ht⟩, memo) =>
+    enterMap f memo b (k + 1) (fun h hc => mapX f memo b (k + 1) h hc) |>.lift fun (⟨b', hb⟩, memo) =>
+    Squash.mk (⟨e.updateLambdaE! t' b', by rw [he, mapP_lam h, ht, hb]⟩, memo)
+  | .forallE _ t b _ =>
+    enterMap f memo t k (fun h hc => mapX f memo t k h hc) |>.lift fun (⟨t', ht⟩, memo) =>
+    enterMap f memo b (k + 1) (fun h hc => mapX f memo b (k + 1) h hc) |>.lift fun (⟨b', hb⟩, memo) =>
+    Squash.mk (⟨e.updateForallE! t' b', by rw [he, mapP_forallE h, ht, hb]⟩, memo)
+  | .letE _ t v b _ =>
+    enterMap f memo t k (fun h hc => mapX f memo t k h hc) |>.lift fun (⟨t', ht⟩, memo) =>
+    enterMap f memo v k (fun h hc => mapX f memo v k h hc) |>.lift fun (⟨v', hv⟩, memo) =>
+    enterMap f memo b (k + 1) (fun h hc => mapX f memo b (k + 1) h hc) |>.lift fun (⟨b', hb⟩, memo) =>
+    Squash.mk (⟨e.updateLetE! t' v' b', by rw [he, mapP_letE h, ht, hv, hb]⟩, memo)
+  | .mdata _ x =>
+    enterMap f memo x k (fun h hc => mapX f memo x k h hc) |>.lift fun (⟨x', hx⟩, memo) =>
+    Squash.mk (⟨e.updateMData! x', by rw [he, mapP_mdata h, hx]⟩, memo)
+  | .proj _ _ x =>
+    enterMap f memo x k (fun h hc => mapX f memo x k h hc) |>.lift fun (⟨x', hx⟩, memo) =>
+    Squash.mk (⟨e.updateProj! x', by rw [he, mapP_proj h, hx]⟩, memo)
+  | .bvar .. | .fvar .. | .mvar .. | .sort .. | .const .. | .lit .. =>
+    absurd hc (by simp [isCompound])
+
+/-- The offset map from offset `k`: the callback at the root, then the walk
+(the root is never probed: it cannot be reached again). -/
+@[inline] def mapOff (f : Expr → Nat → Option Expr) (e : Expr) (k : Nat) : Expr :=
+  match h : f e k with
+  | some r => r
+  | none => if hc : isCompound e then resVal (mapX f none e k h hc) else e
+
+theorem mapOff_eq (f : Expr → Nat → Option Expr) (e : Expr) (k : Nat) :
+    mapOff f e k = mapP f e k := by
+  unfold mapOff
+  split
+  · rename_i r h; exact (mapP_some h).symm
+  · rename_i h
+    split
+    · exact resVal_eq _
+    · rename_i hc; exact (mapP_leaf h (by simpa using hc)).symm
 
 /-- Twin of `Expr.liftLooseBVars e s d`: loose `bvar i ≥ s` to `bvar (i + d)`. -/
 def liftLooseBVars (e : Expr) (s d : Nat) : Expr :=
@@ -143,7 +338,7 @@ def liftLooseBVars (e : Expr) (s d : Nat) : Expr :=
     if x.looseBVarRange ≤ s + k then some x else
     match x with
     | .bvar i => some (.bvar (i + d))
-    | _ => none) e 0 {}).1
+    | _ => none) e 0 )
 
 /-- Twin of `Expr.lowerLooseBVars e s d`: loose `bvar i ≥ s` to `bvar (i - d)`. -/
 def lowerLooseBVars (e : Expr) (s d : Nat) : Expr :=
@@ -152,27 +347,32 @@ def lowerLooseBVars (e : Expr) (s d : Nat) : Expr :=
     if x.looseBVarRange ≤ s + k then some x else
     match x with
     | .bvar i => some (.bvar (i - d))
-    | _ => none) e 0 {}).1
+    | _ => none) e 0 )
 
-/-- Twin of `instantiateListC` (Lean's `instantiate`): `bvar (k + j)` to
-`subst[j]` lifted by `k`, above the substitution lowered by its size. -/
-def instantiate (e : Expr) (subst : Array Expr) : Expr :=
-  let n := subst.size
+/-- The substitution of `n` values read by `get`: `bvar (k + j)` (`j < n`) to
+`get j` lifted by `k`, above the substitution lowered by `n`. -/
+@[inline] def instantiateBy (e : Expr) (n : Nat) (get : Nat → Expr) : Expr :=
   if n == 0 || !e.hasLooseBVars then e else
   (mapOff (fun x k =>
     if x.looseBVarRange ≤ k then some x else
     match x with
     | .bvar i =>
       if i < k then some x
-      else if i - k < n then some (liftLooseBVars (subst[i - k]!) 0 k)
-      else some (.bvar (i - n))
-    | _ => none) e 0 {}).1
+      else if i - k < n then some (liftLooseBVars (get (i - k)) 0 k)
+      else some (mkBvar (i - n))
+    | _ => none) e 0 )
+
+/-- Twin of `instantiateListC` (Lean's `instantiate`): `bvar (k + j)` to
+`subst[j]` lifted by `k`, above the substitution lowered by its size. -/
+def instantiate (e : Expr) (subst : Array Expr) : Expr :=
+  instantiateBy e subst.size (fun j => subst[j]!)
 
 /-- Twin of `instantiate1C`. -/
-@[inline] def instantiate1 (e v : Expr) : Expr := instantiate e #[v]
+def instantiate1 (e v : Expr) : Expr := instantiateBy e 1 (fun _ => v)
 
 /-- Twin of `instantiateRev`: `bvar 0` is the last element. -/
-@[inline] def instantiateRev (e : Expr) (subst : Array Expr) : Expr := instantiate e subst.reverse
+def instantiateRev (e : Expr) (subst : Array Expr) : Expr :=
+  instantiateBy e subst.size (fun j => subst[subst.size - 1 - j]!)
 
 /-- Lean's `instantiateRevRange e beg end subst`. -/
 @[inline] def instantiateRevRange (e : Expr) (beg stop : Nat) (subst : Array Expr) : Expr :=
@@ -203,14 +403,14 @@ def abstract (e : Expr) (xs : Array Expr) : Expr :=
     match x with
     | .fvar id => (idx[id]?).map fun j =>
       let i := k + n - 1 - j
-      if i ≤ maxBVarIdx then .bvar i else rangePoison
-    | _ => none) e 0 {}).1
+      if i ≤ maxBVarIdx then mkBvar i else rangePoison
+    | _ => none) e 0 )
 
 /-- Lean's `abstractRange e n xs`. -/
 @[inline] def abstractRange (e : Expr) (n : Nat) (xs : Array Expr) : Expr :=
   abstract e (xs.extract 0 n)
 
-/-- The root of an interned free variable's name (`Lean/Kernel/InLean/StateC.lean`):
+/-- The root of an interned free variable's name (`Lean.Kernel.InLean.StateC`):
 the variable at depth `d` numbered `n` is named `fvRoot.d.n`. -/
 def fvRoot : Name := `_inlean_fv
 
@@ -233,27 +433,61 @@ def abstractDepthsFrom (e : Expr) (d k c₀ : Nat) : Expr :=
       | some idx =>
         if d ≤ idx ∧ idx < d + k then
           let i := c + (d + k - 1 - idx)
-          some (if i ≤ maxBVarIdx then .bvar i else rangePoison)
+          some (if i ≤ maxBVarIdx then mkBvar i else rangePoison)
         else some x
       | none => some x
-    | _ => none) e c₀ {}).1
+    | _ => none) e c₀ )
 
 /-- `abstractDepthsFrom` at binder offset `0` (con-leche's `abstractRangeC e d k`). -/
 @[inline] def abstractDepths (e : Expr) (d k : Nat) : Expr := abstractDepthsFrom e d k 0
 
+/-- The level depth C's `Level.mkData` accepts. -/
+def maxLevelDepth : Nat := 16777215
+
+/-- The deepest of `us`, by their cached depths. -/
+def maxDepthOf (us : List Level) : Nat := us.foldr (fun u m => max u.data.depth.toNat m) 0
+
+/-- Substituting levels at most `md` deep into `u` stays within C's bound,
+by `u`'s cached depth: the substitution adds at most `md`. -/
+@[inline] def depthFits (md : Nat) (u : Level) : Bool := u.data.depth.toNat + md ≤ maxLevelDepth
+
+/-- The `imax` chain `inferPisOutI stk v` builds stays within C's depth
+bound, by cached depths: each `imax` adds at most one to the deepest level.
+(`.succ u` is `depthFits 1 u`, one `imax u v` is `imaxChainFits [u] v`.) -/
+def imaxChainFits (stk : List Level) (v : Level) : Bool :=
+  maxDepthOf (v :: stk) + stk.length ≤ maxLevelDepth
+
 /-- Twin of `instLevelParams`: the level parameters `ps` to `us` in every
-`sort` and `const`, by con-leche's non-simplifying `Lvl.subst` (core's
-`Level.instantiateParams` compares by the opaque `Level.beq`). -/
+`sort` and `const`, by con-leche's non-simplifying `Lvl.subst` (core's `Level.instantiateParams` compares by the opaque `Level.beq`).  A
+node whose substituted level could pass C's depth bound becomes
+`rangePoison`, which the checker's call sites report (`instLevelParamsChecked?`). -/
 def instantiateLevelParams (e : Expr) (ps : List Name) (us : List Level) : Expr :=
   if ps.isEmpty || us.isEmpty || !e.hasLevelParam then e else
+  let md := maxDepthOf us
   (mapOff (fun x _ =>
     if !x.hasLevelParam then some x else
     match x with
-    | .sort u => some (x.updateSort! (Lvl.subst ps us u))
-    | .const _ ls => some (x.updateConst! (ls.map (Lvl.subst ps us)))
-    | _ => none) e 0 {}).1
+    | .sort u =>
+      some (if depthFits md u then x.updateSort! (Lvl.subst ps us u) else rangePoison)
+    | .const _ ls =>
+      some (if ls.all (depthFits md) then x.updateConst! (ls.map (Lvl.subst ps us))
+        else rangePoison)
+    | _ => none) e 0 )
 
-/-- The GENERATOR's level instantiation (unverified, `Lean/Kernel/InLean/IndGen.lean`):
+/-- `instantiateLevelParams`, `none` where it wrote `rangePoison` (a level
+past C's depth bound, where C's `Level.mkData` would abort).  Checker terms
+have no metavariable, so `hasExprMVar` reads the poison. -/
+def instLevelParamsChecked? (e : Expr) (ps : List Name) (us : List Level) : Option Expr :=
+  let r := instantiateLevelParams e ps us
+  if r.hasExprMVar then none else some r
+
+/-- `Lvl.subst` over a list of levels, `none` where a result could pass C's
+depth bound. -/
+def substLevelsChecked? (ps : List Name) (us : List Level) (ls : List Level) : Option (List Level) :=
+  let md := maxDepthOf us
+  if ls.all (depthFits md) then some (ls.map (Lvl.subst ps us)) else none
+
+/-- The GENERATOR's level instantiation (unverified, `Lean.Kernel.InLean.IndGen`):
 Lean's simplifying `Level.instantiateParams`, whose shapes the official
 constants carry. -/
 def instantiateLevelParamsGen (e : Expr) (ps : List Name) (us : List Level) : Expr :=
@@ -263,39 +497,126 @@ def instantiateLevelParamsGen (e : Expr) (ps : List Name) (us : List Level) : Ex
     match x with
     | .sort u => some (x.updateSort! (u.instantiateParams ps us))
     | .const _ ls => some (x.updateConst! (ls.map (·.instantiateParams ps us)))
-    | _ => none) e 0 {}).1
+    | _ => none) e 0 )
 
 /-- Generic memoised replacement (no offset; Lean's `Expr.replace`). -/
 @[inline] def replace (f : Expr → Option Expr) (e : Expr) : Expr :=
-  (mapOff (fun x _ => f x) e 0 {}).1
+  (mapOff (fun x _ => f x) e 0 )
 
-/-- The memoised fold of a `Bool` property over every node (shared nodes
-visited once): `some` stops the descent at a node. -/
-def anyNode (p : Expr → Nat → Option Bool) : Expr → Nat → Std.HashMap (Expr × Nat) Bool →
-    Bool × Std.HashMap (Expr × Nat) Bool
-  | e, k, memo =>
-    match p e k with
-    | some b => (b, memo)
-    | none =>
-      if !isCompound e then (false, memo) else
-      match memo[(e, k)]? with
-      | some b => (b, memo)
-      | none =>
-        let (r, memo) : Bool × Std.HashMap (Expr × Nat) Bool := match e with
-          | .app g a =>
-            let (b, memo) := anyNode p g k memo
-            if b then (true, memo) else anyNode p a k memo
-          | .lam _ t b _ | .forallE _ t b _ =>
-            let (r, memo) := anyNode p t k memo
-            if r then (true, memo) else anyNode p b (k + 1) memo
-          | .letE _ t v b _ =>
-            let (r, memo) := anyNode p t k memo
-            if r then (true, memo) else
-            let (r, memo) := anyNode p v k memo
-            if r then (true, memo) else anyNode p b (k + 1) memo
-          | .mdata _ x | .proj _ _ x => anyNode p x k memo
-          | _ => (false, memo)
-        (r, memo.insert (e, k) r)
+/-- **The plain fold of a `Bool` property**: `p` decides a node (`some`
+stops the descent), or the fold asks the children, left to right. -/
+def anyP (p : Expr → Nat → Option Bool) (e : Expr) (k : Nat) : Bool :=
+  match p e k with
+  | some b => b
+  | none =>
+    match e with
+    | .app g a => anyP p g k || anyP p a k
+    | .lam _ t b _ => anyP p t k || anyP p b (k + 1)
+    | .forallE _ t b _ => anyP p t k || anyP p b (k + 1)
+    | .letE _ t v b _ => anyP p t k || anyP p v k || anyP p b (k + 1)
+    | .mdata _ x => anyP p x k
+    | .proj _ _ x => anyP p x k
+    | _ => false
+
+theorem anyP_some {p : Expr → Nat → Option Bool} {e : Expr} {k : Nat} {b : Bool}
+    (h : p e k = some b) : anyP p e k = b := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_leaf {p : Expr → Nat → Option Bool} {e : Expr} {k : Nat}
+    (h : p e k = none) (hc : isCompound e = false) : anyP p e k = false := by
+  rw [anyP.eq_def, h]; cases e <;> simp_all [isCompound]
+
+theorem anyP_app {p : Expr → Nat → Option Bool} {g a : Expr} {k : Nat} (h : p (.app g a) k = none) :
+    anyP p (.app g a) k = (anyP p g k || anyP p a k) := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_lam {p : Expr → Nat → Option Bool} {n t b bi} {k : Nat}
+    (h : p (.lam n t b bi) k = none) :
+    anyP p (.lam n t b bi) k = (anyP p t k || anyP p b (k + 1)) := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_forallE {p : Expr → Nat → Option Bool} {n t b bi} {k : Nat}
+    (h : p (.forallE n t b bi) k = none) :
+    anyP p (.forallE n t b bi) k = (anyP p t k || anyP p b (k + 1)) := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_letE {p : Expr → Nat → Option Bool} {n t v b nd} {k : Nat}
+    (h : p (.letE n t v b nd) k = none) :
+    anyP p (.letE n t v b nd) k = (anyP p t k || anyP p v k || anyP p b (k + 1)) := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_mdata {p : Expr → Nat → Option Bool} {m x} {k : Nat} (h : p (.mdata m x) k = none) :
+    anyP p (.mdata m x) k = anyP p x k := by
+  rw [anyP.eq_def, h]
+
+theorem anyP_proj {p : Expr → Nat → Option Bool} {sn i x} {k : Nat} (h : p (.proj sn i x) k = none) :
+    anyP p (.proj sn i x) k = anyP p x k := by
+  rw [anyP.eq_def, h]
+
+/-- The child step of `anyX`: the callback (the cutoff), the compound test,
+the exclusivity read. -/
+@[inline] def enterAny (p : Expr → Nat → Option Bool) (memo : MemoXP (anyP p)) (e : @& Expr)
+    (k : Nat) (rec : p e k = none → isCompound e = true → Squash (ResXP (anyP p) e k)) :
+    Squash (ResXP (anyP p) e k) :=
+  match h : p e k with
+  | some b => Squash.mk (⟨b, (anyP_some h).symm⟩, memo)
+  | none =>
+    if hc : isCompound e then withExcl e fun excl =>
+      if excl then rec h hc else memo.shared e k fun _ => rec h hc
+    else Squash.mk (⟨false, (anyP_leaf h (by simpa using hc)).symm⟩, memo)
+
+/-- **The memoised fold**: the walk of `anyP p`, its node past the
+callback; a `true` stops it. -/
+@[specialize] def anyX (p : Expr → Nat → Option Bool) (memo : MemoXP (anyP p)) (e : @& Expr)
+    (k : Nat) (h : p e k = none) (hc : isCompound e = true) :
+    Squash (ResXP (anyP p) e k) :=
+  match he : e with
+  | .app g a =>
+    enterAny p memo g k (fun h hc => anyX p memo g k h hc) |>.lift fun (⟨r₁, h₁⟩, memo) =>
+    if hr : r₁ then Squash.mk (⟨true, by rw [anyP_app h, ← h₁, hr]; rfl⟩, memo) else
+    enterAny p memo a k (fun h hc => anyX p memo a k h hc) |>.lift fun (⟨r₂, h₂⟩, memo) =>
+    Squash.mk (⟨r₂, by rw [anyP_app h, ← h₁, ← h₂]; simp [hr]⟩, memo)
+  | .lam _ t b _ =>
+    enterAny p memo t k (fun h hc => anyX p memo t k h hc) |>.lift fun (⟨r₁, h₁⟩, memo) =>
+    if hr : r₁ then Squash.mk (⟨true, by rw [anyP_lam h, ← h₁, hr]; rfl⟩, memo) else
+    enterAny p memo b (k + 1) (fun h hc => anyX p memo b (k + 1) h hc) |>.lift fun (⟨r₂, h₂⟩, memo) =>
+    Squash.mk (⟨r₂, by rw [anyP_lam h, ← h₁, ← h₂]; simp [hr]⟩, memo)
+  | .forallE _ t b _ =>
+    enterAny p memo t k (fun h hc => anyX p memo t k h hc) |>.lift fun (⟨r₁, h₁⟩, memo) =>
+    if hr : r₁ then Squash.mk (⟨true, by rw [anyP_forallE h, ← h₁, hr]; rfl⟩, memo) else
+    enterAny p memo b (k + 1) (fun h hc => anyX p memo b (k + 1) h hc) |>.lift fun (⟨r₂, h₂⟩, memo) =>
+    Squash.mk (⟨r₂, by rw [anyP_forallE h, ← h₁, ← h₂]; simp [hr]⟩, memo)
+  | .letE _ t v b _ =>
+    enterAny p memo t k (fun h hc => anyX p memo t k h hc) |>.lift fun (⟨r₁, h₁⟩, memo) =>
+    if hr : r₁ then Squash.mk (⟨true, by rw [anyP_letE h, ← h₁, hr]; rfl⟩, memo) else
+    enterAny p memo v k (fun h hc => anyX p memo v k h hc) |>.lift fun (⟨r₂, h₂⟩, memo) =>
+    if hr₂ : r₂ then Squash.mk (⟨true, by rw [anyP_letE h, ← h₁, ← h₂, hr₂]; simp⟩, memo) else
+    enterAny p memo b (k + 1) (fun h hc => anyX p memo b (k + 1) h hc) |>.lift fun (⟨r₃, h₃⟩, memo) =>
+    Squash.mk (⟨r₃, by rw [anyP_letE h, ← h₁, ← h₂, ← h₃]; simp [hr, hr₂]⟩, memo)
+  | .mdata _ x =>
+    enterAny p memo x k (fun h hc => anyX p memo x k h hc) |>.lift fun (⟨r, hx⟩, memo) =>
+    Squash.mk (⟨r, by rw [anyP_mdata h, hx]⟩, memo)
+  | .proj _ _ x =>
+    enterAny p memo x k (fun h hc => anyX p memo x k h hc) |>.lift fun (⟨r, hx⟩, memo) =>
+    Squash.mk (⟨r, by rw [anyP_proj h, hx]⟩, memo)
+  | .bvar .. | .fvar .. | .mvar .. | .sort .. | .const .. | .lit .. =>
+    absurd hc (by simp [isCompound])
+
+/-- The fold from offset `k`: the callback at the root, then the walk. -/
+@[inline] def anyNode (p : Expr → Nat → Option Bool) (e : Expr) (k : Nat) : Bool :=
+  match h : p e k with
+  | some b => b
+  | none => if hc : isCompound e then resVal (anyX p none e k h hc) else false
+
+theorem anyNode_eq (p : Expr → Nat → Option Bool) (e : Expr) (k : Nat) :
+    anyNode p e k = anyP p e k := by
+  unfold anyNode
+  split
+  · rename_i b h; exact (anyP_some h).symm
+  · rename_i h
+    split
+    · exact resVal_eq _
+    · rename_i hc; exact (anyP_leaf h (by simpa using hc)).symm
 
 /-- Twin of `Expr.hasLooseBVarB i e`. -/
 def hasLooseBVar (e : Expr) (i : Nat) : Bool :=
@@ -303,11 +624,11 @@ def hasLooseBVar (e : Expr) (i : Nat) : Bool :=
     if x.looseBVarRange ≤ i + k then some false else
     match x with
     | .bvar j => some (j == i + k)
-    | _ => none) e 0 {}).1
+    | _ => none) e 0 )
 
 /-- Does some node satisfy `p` (Lean's `(e.find? p).isSome`, memoised)? -/
 def any (p : Expr → Bool) (e : Expr) : Bool :=
-  (anyNode (fun x _ => if p x then some true else none) e 0 {}).1
+  (anyNode (fun x _ => if p x then some true else none) e 0 )
 
 /-- **In range, by the term alone**: every `bvar` index and level
 depth below what C's `mkData` accepts, and no metavariable (so no
@@ -320,12 +641,12 @@ def inRange (e : Expr) : Bool :=
     | .mvar _ => some true
     | .sort u => some (16777215 < Lvl.depth u)
     | .const _ us => some (us.any fun u => 16777215 < Lvl.depth u)
-    | _ => none) e 0 {}).1
+    | _ => none) e 0 )
 
 /-- The memoised fold collecting values of the nodes `pick` selects
 (shared nodes visited once; `stop` cuts a subtree). -/
 def collect (stop : Expr → Bool) (pick : Expr → Option α) (e : Expr) : Array α :=
-  (go e ({} : Std.HashSet Expr) #[]).2
+  (go e (Std.HashSet.emptyWithCapacity (e.approxDepth.toNat + 8)) #[]).2
 where
   go (e : Expr) (seen : Std.HashSet Expr) (acc : Array α) : Std.HashSet Expr × Array α :=
     if stop e then (seen, acc) else
@@ -388,6 +709,27 @@ end Lean.Kernel.InLean
 
 namespace Lean.Expr
 open Lean.Kernel.InLean
+
+/-- The head of an application spine, `mdata` read through (as con-leche's
+`getAppFn` on the term without it). -/
+def getAppFnT : Expr → Expr
+  | .app f _ => getAppFnT f
+  | .mdata _ e => getAppFnT e
+  | e => e
+
+/-- The spine's arguments, `mdata` read through. -/
+def getAppArgsT (e : Expr) : Array Expr := (go e []).toArray
+where
+  go : Expr → List Expr → List Expr
+    | .app f a, acc => go f (a :: acc)
+    | .mdata _ e, acc => go e acc
+    | _, acc => acc
+
+/-- The spine's argument count, `mdata` read through. -/
+def getAppNumArgsT : Expr → Nat
+  | .app f _ => getAppNumArgsT f + 1
+  | .mdata _ e => getAppNumArgsT e
+  | _ => 0
 @[inline] def inst1I (e v : Expr) : Expr := EO.instantiate1 e v
 @[inline] def instI (e : Expr) (subst : Array Expr) : Expr := EO.instantiate e subst
 @[inline] def instRevI (e : Expr) (subst : Array Expr) : Expr := EO.instantiateRev e subst
@@ -413,6 +755,8 @@ end Lean.Expr
 namespace Lean.Kernel.InLean.EO
 
 open Lean
+
+attribute [local instance 2000] instBEqExprExact
 
 /-- The memo probe and write-back around one compound node's step. -/
 @[inline] def withMemo (e : Expr) (memo : Memo) (k : Memo → Expr × Memo) : Expr × Memo :=
@@ -445,9 +789,10 @@ def stripMDataGo : Expr → Memo → Expr × Memo
     (e.updateProj! x', memo)
   | e, memo => (e, memo)
 
-def stripMData (e : Expr) : Expr := (stripMDataGo e {}).1
+def stripMData (e : Expr) : Expr := (stripMDataGo e (freshFor e)).1
 
-/-- Twin of `Expr.depthGo` (memoised). -/
+/-- Twin of `Expr.depthGo` (memoised), on the reading: an `mdata` node is read
+through. -/
 def depthGo : Expr → Std.HashMap Expr Nat → Nat × Std.HashMap Expr Nat
   | e, memo =>
     if !isCompound e then (1, memo) else
@@ -468,50 +813,51 @@ def depthGo : Expr → Std.HashMap Expr Nat → Nat × Std.HashMap Expr Nat
           let (d₂, memo) := depthGo v memo
           let (d₃, memo) := depthGo b memo
           (max (max d₁ d₂) d₃ + 1, memo)
-        | .proj _ _ x | .mdata _ x =>
+        | .mdata _ x => depthGo x memo
+        | .proj _ _ x =>
           let (d, memo) := depthGo x memo
           (d + 1, memo)
         | _ => (1, memo)
       (r, memo.insert e r)
 
-def depth (e : Expr) : Nat := (depthGo e {}).1
+def depth (e : Expr) : Nat := (depthGo e (freshFor e)).1
+
+/-- The memo probe and write-back around one compound node's hash. -/
+@[inline] def withMemoH (e : Expr) (memo : Std.HashMap Expr UInt64)
+    (k : Std.HashMap Expr UInt64 → UInt64 × Std.HashMap Expr UInt64) :
+    UInt64 × Std.HashMap Expr UInt64 :=
+  match memo[e]? with
+  | some h => (h, memo)
+  | none => let (h, memo) := k memo; (h, memo.insert e h)
+
+/-- **A hash compatible with `Expr.clEq`**: binder names, infos, `nonDep` and
+`mdata` not read (Lean's cached hash reads all but `mdata`; a leaf has none
+and is hashed by it).  A memoised walk. -/
+def clHashGo : Expr → Std.HashMap Expr UInt64 → UInt64 × Std.HashMap Expr UInt64
+  | .mdata _ x, memo => clHashGo x memo
+  | e@(.app f a), memo => withMemoH e memo fun memo =>
+    let (h₁, memo) := clHashGo f memo
+    let (h₂, memo) := clHashGo a memo
+    (mixHash 5 (mixHash h₁ h₂), memo)
+  | e@(.lam _ t b _), memo => withMemoH e memo fun memo =>
+    let (h₁, memo) := clHashGo t memo
+    let (h₂, memo) := clHashGo b memo
+    (mixHash 6 (mixHash h₁ h₂), memo)
+  | e@(.forallE _ t b _), memo => withMemoH e memo fun memo =>
+    let (h₁, memo) := clHashGo t memo
+    let (h₂, memo) := clHashGo b memo
+    (mixHash 7 (mixHash h₁ h₂), memo)
+  | e@(.letE _ t v b _), memo => withMemoH e memo fun memo =>
+    let (h₁, memo) := clHashGo t memo
+    let (h₂, memo) := clHashGo v memo
+    let (h₃, memo) := clHashGo b memo
+    (mixHash 8 (mixHash h₁ (mixHash h₂ h₃)), memo)
+  | e@(.proj s i x), memo => withMemoH e memo fun memo =>
+    let (h₁, memo) := clHashGo x memo
+    (mixHash 11 (mixHash (hash s) (mixHash (hash i) h₁)), memo)
+  | e, memo => (hash e, memo)
+
+def clHash (e : Expr) : UInt64 := (clHashGo e (freshFor e)).1
 
 end Lean.Kernel.InLean.EO
 
-namespace Lean.Kernel.InLean.EO
-
-open Lean
-
-/-- **Alpha-equivalence** (binder names and infos, a `let`'s `nonDep`
-ignored; everything else exact): con-leche's expression equality, whose
-terms carry no binder names, and official's C++ `operator==`.  A
-memoised pair walk, pointer-first. -/
-def alphaEqGo : Expr → Expr → Std.HashMap (Expr × Expr) Bool → Bool × Std.HashMap (Expr × Expr) Bool
-  | a, b, memo =>
-    if Expr.beqI a b then (true, memo) else
-    match memo[(a, b)]? with
-    | some r => (r, memo)
-    | none =>
-      let (r, memo) : Bool × Std.HashMap (Expr × Expr) Bool := match a, b with
-        | .app f x, .app g y =>
-          let (r, memo) := alphaEqGo f g memo
-          if r then alphaEqGo x y memo else (false, memo)
-        | .lam _ t c _, .lam _ t' c' _ | .forallE _ t c _, .forallE _ t' c' _ =>
-          let (r, memo) := alphaEqGo t t' memo
-          if r then alphaEqGo c c' memo else (false, memo)
-        | .letE _ t v c _, .letE _ t' v' c' _ =>
-          let (r, memo) := alphaEqGo t t' memo
-          if !r then (false, memo) else
-          let (r, memo) := alphaEqGo v v' memo
-          if r then alphaEqGo c c' memo else (false, memo)
-        | .proj s i x, .proj s' i' x' =>
-          if s == s' && i == i' then alphaEqGo x x' memo else (false, memo)
-        | _, _ => (false, memo)
-      (r, memo.insert (a, b) r)
-
-/-- Alpha-equivalence up to `mdata` (both sides stripped first, so
-no `KVMap`/`Syntax` equality — core's `Syntax.structEq` is opaque — is
-consulted; con-leche's terms carry no `mdata`). -/
-def alphaEq (a b : Expr) : Bool := (alphaEqGo (stripMData a) (stripMData b) {}).1
-
-end Lean.Kernel.InLean.EO

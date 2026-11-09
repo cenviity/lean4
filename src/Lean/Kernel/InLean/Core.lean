@@ -45,7 +45,7 @@ builtin_initialize natMaxSizeEnv : Nat ← do
 
 /-- The configuration the kernel runs with inside core. -/
 def coreConfig : Config :=
-  { coreAxioms := true, uncertifiedNatOps := true, limits := { natMaxBytes := natMaxSizeEnv } }
+  { coreAxioms := true, uncertifiedNatOps := true, limits := { maxNatSize := natMaxSizeEnv } }
 
 /-- The configuration of one `addDecl` run: `coreConfig` under the elaborator's recursion limit
 (`0` is none) and the poll `poll`. -/

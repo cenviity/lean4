@@ -76,12 +76,14 @@ exit, so the checker's soundness holds whatever they are.
   unfolding (`Event`); a limit it answers is the error.  The heartbeat
   budget, the cancellation token and the diagnostics' unfold counter live
   behind it (core's glue reads and writes the runtime).
-* `natMaxBytes`: the largest numeral the core computes or infers, in
-  bytes (`natSizeBytes`), official `LEAN_NAT_MAX_SIZE`. -/
+* `maxNatSize`: twin of con-leche's `maxNatSize` (the run's parameter,
+  `CState.maxNatSize`): the largest numeral the core computes or infers, in
+  bytes (`natSizeBytes`), official `LEAN_NAT_MAX_SIZE` (default 128 MiB,
+  `maxNatSizeDefault`). -/
 structure Limits where
   recDepth : Option Nat := none
   poll : Option (Event → Option Limit) := none
-  natMaxBytes : Nat := 128 * 1024 * 1024
+  maxNatSize : Nat := 134217728
 
 instance : Inhabited Limits := ⟨{}⟩
 
@@ -105,7 +107,7 @@ structure FEnv where
   block's install); InLean's at-use readers read a marked member as those
   environments do: its capabilities at the shape's field count (`capsOf`), no
   projection table (`findProj?`, `hasTable`, `tableFields?`).  Set where the
-  formers are pushed (`checkBlockIndsF`); the job's environments are dropped
+  formers are pushed (`checkBlockIndsC`); the job's environments are dropped
   with it, so the installed block is read off its entries. -/
   pending : List (Name × Nat) := []
   /-- The resource limits (`Limits`). -/
